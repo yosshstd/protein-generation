@@ -1,0 +1,58 @@
+# train_stage1.py 用の設定。
+# コマンドラインからは `key=value` 形式で上書きできます（例: training.learning_rate=1e-4）。
+# 主なキーは SFTConfig のフィールド名と一致させてあります。
+
+# Model Configuration
+model:
+  model_name: "GreatCaptainNemo/ProLLaMA_Stage_1"
+  # トークン長の上限。フィルタ後の最長は 711 トークン（README 参照）。
+  max_seq_length: 720
+  dtype: null          # null = 自動（bf16）
+  # 7B を fp16/bf16 で載せると 8GB の RTX 3060 Ti には収まらないので 4bit (NF4) を使います。
+  load_in_4bit: true
+
+# LoRA Configuration
+lora:
+  r: 64
+  lora_alpha: 128
+  lora_dropout: 0.0
+  bias: "none"
+  use_rslora: false
+  use_gradient_checkpointing: "unsloth"
+  random_state: 0
+
+# Dataset Configuration
+dataset:
+  data_dir: "data"
+  reps_file: "protrek650m_swissprot_50pct_reps.parquet"
+  # 動作確認用に先頭 N 件だけ使う。null なら全件。
+  limit: null
+
+output_dir: "outputs/prollama_stage1_text"
+
+# Training Configuration
+# SFTConfig にそのまま渡るので、フィールド名を変えると起動時に落ちます。
+training:
+  per_device_train_batch_size: 1     # 8GB GPU では 1 固定
+  gradient_accumulation_steps: 2
+  num_train_epochs: 1
+  learning_rate: 5.0e-4
+  lr_scheduler_type: "cosine"
+  warmup_steps: 0.0                 # trl 1.15 では float は総 step に対する比率
+  weight_decay: 0.01
+  optim: "adamw_8bit"
+  bf16: true
+  seed: 0
+  logging_steps: 10
+  save_strategy: "steps"
+  save_steps: 500
+  save_total_limit: 2
+  report_to: "none"                  # wandb は使わない
+  dataloader_num_workers: 2
+  dataloader_pin_memory: true
+  # packing: 複数のサンプルを max_seq_length まで詰めて 1 本の系列にします。
+  # 独自 collator は使わず、trl 標準の packing + padding-free に任せます。
+  packing: true
+  packing_strategy: "bfd"            # サンプル境界を壊さない（はみ出す分は捨てる）
+  shuffle_dataset: true
+  gradient_checkpointing: false      # モデル側で有効化済み

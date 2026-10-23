@@ -1,0 +1,51 @@
+[project]
+name = "protein-generation"
+version = "0.1.0"
+description = "LoRA-tune ProLLaMA_Stage_1 to decode amino acid sequences from ProTrek_650M embeddings"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "accelerate",
+    "bitsandbytes",
+    "datasets",
+    "faiss-cpu",
+    "huggingface-hub",
+    "numpy",
+    "omegaconf>=2.4.0",
+    "pandas",
+    "protobuf",
+    "pyarrow",
+    "sentencepiece",
+    "torch==2.13.0",
+    "torchvision==0.28.0",
+    "tqdm",
+    "transformers",
+    "triton",
+    "trl",
+    # `base` = the training stack (unsloth_zoo, transformers, trl, peft, ...).
+    # The bare package on main is only the CLI. torch is left to us so the
+    # cu129 index below decides it.
+    "unsloth[base]",
+    "xformers",
+]
+
+[tool.uv.sources]
+# Installed from git, not PyPI.
+unsloth = { git = "https://github.com/unslothai/unsloth.git" }
+
+# cu129 wheels: the WSL driver is CUDA 12.6, and the cu130 builds report
+# torch.cuda.is_available() == False on this machine.
+torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+triton = { index = "pytorch-cu129" }
+xformers = { index = "pytorch-cu129" }
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+# Target Linux (WSL2) only. unsloth's markers carry Windows-only deps
+# (hf-transfer, triton-windows) that have no business in this lockfile.
+[tool.uv]
+environments = ["sys_platform == 'linux'"]

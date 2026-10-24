@@ -1,44 +1,59 @@
 # protein-generation
 
-ProTrek-650M のタンパク質埋め込みを入力に、LLM（ProLLaMA_Stage_1）でアミノ酸配列を生成するモデルを LoRA で学習するためのリポジトリです。
+ProTrek-650M のタンパク質埋め込みを入力に、ProLLaMA_Stage_1 でアミノ酸配列を生成するモデルを
+LoRA + projector で学習するリポジトリです。
 
-ProTrek で配列をベクトルにし、そのベクトルを ProLLaMA の 10 トークン分の入力（soft prompt）に変換して差し込んで、続きの配列を生成させます。
+配列を ProTrek で 1024 次元ベクトルにし、`ProteinProjector` で K 個（既定 10）の入力埋め込み
+スロットに射影して、ProLLaMA 本来のプロンプト `Seq=<` の直前に差し込みます。指示部分
+（`▁Seq = <`）はベースモデルが事前学習した形のまま残すので、モデルは「指示 + ベクトル」から
+続きの配列を生成します。
 
 ```
-アミノ酸配列 ──ProTrek_650M──▶ 1024次元ベクトル
-                                   │
-                    (平均ベクトルを引き、Linear で 10×4096 次元へ射影)
-                                   │
-"<s> <unk>×10 ▁Seq = <" [10個のベクトル] ──ProLLaMA_Stage_1 + LoRA──▶ アミノ酸配列
+アミノ酸配列 ──ProTrek_650M──▶ 1024 次元ベクトル（L2 正規化済み）
+                                     │
+                        平均ベクトルを引く → ProteinProjector（K ヘッド）
+                                     │
+                                     ▼
+<s> <unk>×K ▁Seq = < [K 個のベクトル] ──ProLLaMA_Stage_1 + LoRA──▶ 配列 >
 ```
+
+## パイプライン
+
+3 本で完結します。
+
+| # | コマンド | やること |
+| --- | --- | --- |
+| 1 | `uv run python build_dataset.py` | データ構築（50% クラスタリング → フィルタ → split → parquet、`--upload` で Hub 公開） |
+| 2 | `uv run python train_prollama_from_emb.py` | ベクトル → K スロットの soft prompt で LoRA + projector を学習 |
+| 3 | `uv run python inference_prollama_from_emb.py` | 学習済みアダプタで生成し、長さ・括弧閉じ・不正残基を集計 |
+
+学習と推論は既定で Hub のデータセット（`yosshstd/protrek650m-swissprot50-reps`）を読みます。
+Hub に上げずに試す場合は、`build_dataset.py` の出力ディレクトリを `--dataset` に渡してください。
 
 ## ファイル構成
 
+```
+build_dataset.py                  # 1. データ構築（HF 取得 → クラスタリング → parquet → 任意で公開）
+train_prollama_from_emb.py        # 2. 学習 + 共有パーツ（projector / prefix / 定数）
+inference_prollama_from_emb.py    # 3. 生成・評価
+pyproject.toml / uv.lock          # 依存（uv で管理）
+tools/get_mmseqs.sh               # MMseqs2（静的ビルド）の取得
+legacy/                           # 旧スクリプト置き場（.gitignore 済み・ローカルのみ）
+```
+
 | ファイル | 役割 |
 | --- | --- |
-| `build_dataset.py` | Hugging Face からデータ取得 → 50% クラスタリング → 代表配列の埋め込みを書き出し |
-| `train.py` | ProLLaMA_Stage_1 を LoRA 学習 → 保存 → 生成チェック（ProTrek ベクトルを入力） |
-| `train_stage1.py` | ProTrek ベクトルを使わない stage1 ベースライン（指示のみ） |
-| `config.yaml` | `train_stage1.py` の設定 |
-| `pyproject.toml` | 依存パッケージ（uv で管理） |
-| `uv.lock` | 解決済みのバージョン固定 |
-| `tools/get_mmseqs.sh` | MMseqs2（静的ビルド）の取得スクリプト |
+| `build_dataset.py` | Swiss-Prot 配列 + ProTrek ベクトルを 50% 同一性でクラスタリングし、学習用 parquet を作る |
+| `train_prollama_from_emb.py` | ProLLaMA_Stage_1 に LoRA を付け、projector と一緒に学習する。定数・prefix / answer の組み立て・`ProteinProjector`・`ProjectorTrainerMixin` もここにあり、3 がこれを import する |
+| `inference_prollama_from_emb.py` | 保存したアダプタ + projector でサンプルを生成し、スコアを出す |
+| `pyproject.toml` / `uv.lock` | 依存パッケージとバージョン固定 |
+| `tools/get_mmseqs.sh` | `build_dataset.py` が使う MMseqs2 を取得 |
 
-生成されるもの（すべて `.gitignore` 済み）:
-
-```
-data/
-  SwissProt/ProTrek_650M_UniRef50/sequence/{ids.tsv, sequence.index}   HF から取得
-  protrek650m_swissprot_50pct_reps.parquet / .fasta                    クラスタ代表
-work/          MMseqs2 の作業ディレクトリ
-outputs/
-  embeddings/*.npy, *_meta.parquet                                    学習入力の埋め込み
-  prollama_stage1_protrek650m/                                        学習済み LoRA + projector
-```
+`data/` `work/` `outputs/` は生成物で、すべて `.gitignore` 済みです。
 
 ## セットアップ
 
-Python 3.13 を前提としています。依存はすべて `pyproject.toml` で管理しているので、環境構築は 1 コマンドです。
+Python 3.13 を前提としています。依存は `pyproject.toml` にまとまっているので 1 コマンドです。
 
 ```bash
 uv sync
@@ -46,11 +61,11 @@ uv sync
 
 `uv.lock` に固定されたバージョンが `.venv` に入ります。unsloth は PyPI ではなく git から取得します
 （`[tool.uv.sources]` で指定済み）。git の `unsloth` 本体には CLI しか入っておらず、学習用の
-依存（`unsloth_zoo` / `transformers` / `trl` など）は `base` extra にあるので
-`unsloth[base]` を指定しています。
+依存（`unsloth_zoo` / `transformers` / `trl` など）は `base` extra にあるので `unsloth[base]` を
+指定しています。
 
-torch / torchvision / triton / xformers は cu129 系を `pyproject.toml` の `[[tool.uv.index]]`
-で指定しています。WSL のドライバが CUDA 12.6 のため、cu130 の wheel だと
+torch / torchvision / triton / xformers は cu129 系を `pyproject.toml` の `[[tool.uv.index]]` で
+指定しています。WSL のドライバが CUDA 12.6 のため、cu130 の wheel だと
 `torch.cuda.is_available()` が False になります。バージョンを上げるときはこの index 指定を
 消さないようにしてください。
 
@@ -62,13 +77,7 @@ torch 2.13.0 向けにビルドされていないためで、unsloth は PyTorch
 xformers is installed but cannot load with torch 2.13.0+cu129 ...
 ```
 
-パッケージを追加するとき:
-
-```bash
-uv add <package>
-```
-
-MMseqs2 を取得します（約 32 MB）:
+MMseqs2（約 32 MB）を取得します。
 
 ```bash
 bash tools/get_mmseqs.sh
@@ -83,9 +92,9 @@ uv run python -c "from unsloth import FastLanguageModel; from trl import SFTTrai
 tools/mmseqs/bin/mmseqs version
 ```
 
-## 使い方
+パッケージを追加するときは `uv add <package>` です。
 
-### 1. データセットを作る
+## 1. データセットを作る
 
 ```bash
 uv run python build_dataset.py
@@ -93,10 +102,31 @@ uv run python build_dataset.py
 
 やっていること:
 
-1. `westlake-repl/faiss_index` の `SwissProt/ProTrek_650M_UniRef50/sequence/` を取得（`ids.tsv` 203 MB + `sequence.index` 2.2 GB）
-2. MMseqs2 `easy-cluster` で 50% 同一性・カバレッジ 0.8 でクラスタリング（569,792 配列 → 代表 118,576 配列）
-3. 代表配列だけを `parquet` と `fasta` に書き出し
-4. faiss インデックスから代表配列の埋め込みを取り出して `outputs/embeddings/` に保存
+1. `westlake-repl/faiss_index` の `SwissProt/ProTrek_650M_UniRef50/sequence/` を取得
+   （`ids.tsv` 約 203 MB + `sequence.index` 約 2.2 GB。`--data-dir` にキャッシュ）
+2. MMseqs2 `easy-cluster` で 50% 同一性・カバレッジ 0.8 にクラスタリング
+   （569,792 配列 → 代表 118,576 配列）
+3. ProTrek が表現できない行を `excluded.parquet` に退避
+   （1024 残基超 6,723 件 + 非標準残基 851 件 = 7,574 件）
+4. 残り 111,002 件を、配列が同一の行を跨がせない形で 100,000 train / 11,002 test に分割
+   （seed 42、長さバケットで層化）
+5. `sequence` と `embedding` を同じ行に入れた自己完結 parquet を書き出す
+6. dataset card と `manifest.json`（件数・sha256・上流リビジョン・ツール版）を生成
+7. `--upload` を付けたときだけ Hub へ公開する
+
+出力:
+
+```
+data/protrek650m_swissprot_50pct_reps.{parquet,fasta}   # クラスタ代表
+outputs/hf_dataset/
+  train.parquet / test.parquet / excluded.parquet
+  split_ids.tsv / manifest.json / README.md             # manifest は件数・sha256・除外内訳
+outputs/embeddings/                                      # --legacy-dir（legacy/train.py 用）
+work/                                                    # MMseqs2 の中間ファイル
+```
+
+ダウンロードとクラスタリングは済んでいれば再利用されるので、中断しても再実行は安く済みます。
+同じ入力からは同じ sha256 のファイルが出ます（`manifest.json` で確認できます）。
 
 主なオプション:
 
@@ -104,76 +134,159 @@ uv run python build_dataset.py
 | --- | --- | --- |
 | `--data-dir` | `data` | HF データと代表配列の置き場所 |
 | `--work-dir` | `work` | MMseqs2 の中間ファイル |
-| `--embeddings-dir` | `outputs/embeddings` | 埋め込みの出力先 |
-| `--mmseqs` | `tools/mmseqs/bin/mmseqs` | MMseqs2 のパス |
+| `--output-dir` | `outputs/hf_dataset` | parquet の出力先 |
+| `--train-size` | `100000` | train に置く件数（残りが test） |
+| `--seed` | `42` | split の乱数 |
 | `--threads` | `16` | クラスタリングのスレッド数 |
+| `--mmseqs` | `tools/mmseqs/bin/mmseqs` | MMseqs2 のパス |
 | `--force-cluster` | なし | クラスタリングをやり直す |
+| `--legacy-dir` | `outputs/embeddings` | `.npy` + meta の出力先（`legacy/train.py` 用） |
+| `--no-legacy` | なし | `.npy` + meta を書かない |
+| `--upload` | なし | `--repo-id` へ公開する |
+| `--private` | なし | 公開リポジトリを private で作る |
+| `--repo-id` | `yosshstd/protrek650m-swissprot50-reps` | 公開先 |
 
-### 2. 学習する
+`--upload` は外向きの操作なので、付けたときだけ実行されます。付けない場合は
+`not uploading; re-run with --upload ...` と表示して終わります。Hub に上げずに学習したいときは、
+`train_prollama_from_emb.py --dataset outputs/hf_dataset` のようにローカルディレクトリを渡します。
 
-```bash
-uv run python train.py
+公開されたデータセットは `datasets` からそのまま読めます。
+
+```python
+from datasets import load_dataset
+
+dataset = load_dataset("yosshstd/protrek650m-swissprot50-reps")
+dataset["train"][0]["sequence"], len(dataset["train"][0]["embedding"])
+# -> ('MKTAYIAKQR...', 1024)
 ```
 
-学習後に `outputs/prollama_stage1_protrek650m/` へ LoRA アダプタ・`protein_projector.pt`・tokenizer を保存し、サンプル 1 件で生成を確認します。
+## 2. 学習する
+
+```bash
+uv run python train_prollama_from_emb.py
+```
+
+流れ:
+
+1. `--dataset` から `sequence` と `embedding` を読み、残基数とアルファベットでフィルタ
+2. トークン長が `--max-seq-length` を超えるサンプルを落とす
+3. サンプルを `--max-seq-length` の行に詰める（packing。`--no-packing` で 1 サンプル 1 行）
+4. ベースモデルを 4bit（`--no-4bit` で fp16/bf16）で読み、LoRA と projector を載せる
+5. 学習 → `--output-dir` にアダプタ・projector・tokenizer を保存 → サンプル 1 件で生成確認
+
+保存物:
+
+```
+outputs/prollama_stage1_emb/
+  adapter_config.json / adapter_model.safetensors   # LoRA
+  protein_projector.pt                              # projector + 復元用メタデータ
+  tokenizer 一式
+  checkpoints/checkpoint-N/                         # 500 step ごと、最新 2 個を保持
+      trainer_state.json など + protein_projector.pt
+```
+
+`protein_projector.pt` には `state_dict` に加えて `num_tokens` / `hidden_size` / `prefix_ids` /
+`placeholder_positions` / `embedding_mean` などが入っていて、推論側はこれだけで同じ構成の
+projector を組み直せます。チェックポイントには必ず一緒に保存されるので、`--resume` しても
+別 step の projector を読むことはありません（run 直下に 1 つ書くと全チェックポイントが共有して
+しまうため、`checkpoint-N/` を自前で組み立てています）。
+
+主なオプション:
 
 | オプション | 既定値 | 説明 |
 | --- | --- | --- |
-| `--max-steps` | なし（1 epoch） | 動作確認だけしたいときは `--max-steps 3` |
-| `--resume` | なし | 最新のチェックポイントから再開 |
-| `--max-seq-length` | `720` | トークン長の上限（フィルタ後の最長は 711 トークン） |
-| `--num-tokens` | `10` | ProTrek ベクトルを何個の soft prompt トークンに変換するか |
+| `--model` | `GreatCaptainNemo/ProLLaMA_Stage_1` | ベースモデル |
+| `--dataset` | `yosshstd/protrek650m-swissprot50-reps` | Hub の repo id かローカルディレクトリ |
+| `--split` | `train` | `train` / `test` |
+| `--limit` | なし | 先頭 N 行だけ使う（フィルタはその後なので実際は N 件未満） |
+| `--max-seq-length` | `720` | 1 行のトークン長上限 |
+| `--num-tokens` | `10` | ベクトルを何スロットに射影するか |
+| `--output-dir` | `outputs/prollama_stage1_emb` | 保存先 |
+| `--max-steps` | なし（1 epoch） | 動作確認は `--max-steps 3` |
+| `--resume` | なし | `checkpoints/` の最新から再開（`--num-tokens` を合わせる） |
+| `--lora-r` / `--lora-alpha` | `128` / `256` | LoRA の rank / alpha |
+| `--learning-rate` | `2e-4` | LoRA 側の学習率 |
+| `--projector-lr` | `2e-4` | projector 側の学習率（別パラメータグループ） |
+| `--batch-size` / `--grad-accum` | `1` / `2` | 8 GB 前提の設定 |
+| `--epochs` | `1.0` | epoch 数 |
+| `--gradient-checkpointing` | `unsloth` | `unsloth` / `standard` / `off` |
+| `--no-4bit` | なし（4bit で読み込む） | 4bit NF4 をやめて fp16/bf16 で読み込む（VRAM を大幅に使う） |
+| `--no-packing` | なし | packing をやめ、バッチ内最長まで pad する |
 
-### 3. stage1 ベースラインを学習する
+学習ログには `candidates` / `kept` / `samples` / `dropped (too many tokens)` / `rows`
+（詰めた後の行数と samples/row）が出ます。`--limit 200 --max-steps 3` で一通り動くか確認できます。
 
-`train_stage1.py` は ProTrek ベクトルを一切使わない比較用のベースラインです。入力は `<s> ▁Seq = <`
-だけで、配列を生成する LoRA を学習します。`train.py` との差分を「ベクトルで制御できるか」だけに
-絞るのが目的で、モデル・プロンプト・loss のマスクは `train.py` と共通です。
+## 3. 生成する
 
 ```bash
-uv run python train_stage1.py
+uv run python inference_prollama_from_emb.py
+uv run python inference_prollama_from_emb.py --start 100 --num-samples 20 --temperature 0.7
 ```
 
-設定は `config.yaml` にまとまっていて、コマンドラインから `key=value` で上書きできます。
+`--adapter` のディレクトリに `protein_projector.pt` が必要です（無い場合は学習を促して終了）。
+データセットの `[--start, --start + --num-samples)` 行を順に使い、各行の正解配列も一緒に表示します。
 
-```bash
-uv run python train_stage1.py training.learning_rate=1e-4
-uv run python train_stage1.py training.packing=false dataset.limit=200 training.max_steps=3
+```text
+[1] 120 aa | closed True | invalid 0 | unique 18 | top: A 0.12, L 0.10, ...
+  MKTAYIAKQRQISFVKSHFSRQ...
+  reference: MKTAYIAKQRQISFVKSHFSRQ...>
+
+=== summary ===
+samples          : 10
+bracket closed   : 10 / 10
+mean length      : 118.4 (min 42, max 201)
+invalid residues : 0 / 1184 (0.00% of emitted characters)
 ```
 
 | オプション | 既定値 | 説明 |
 | --- | --- | --- |
-| `--config` | `config.yaml` | 設定ファイルのパス |
-| `--max-steps` | なし（1 epoch） | 動作確認だけしたいときは `--max-steps 3` |
-| `--resume` | なし | 最新のチェックポイントから再開 |
-| `key=value ...` | なし | 設定の上書き（OmegaConf の dotlist）。`dataset.limit` で先頭 N 件だけ使えます |
+| `--model` | `GreatCaptainNemo/ProLLaMA_Stage_1` | ベースモデル |
+| `--adapter` | `outputs/prollama_stage1_emb` | 学習で保存したディレクトリ |
+| `--dataset` / `--split` | Hub の repo / `train` | 参照配列とベクトルの取得元 |
+| `--start` / `--num-samples` | `0` / `10` | 使う行の範囲 |
+| `--max-new-tokens` | `256` | 生成長の上限 |
+| `--temperature` / `--top-k` / `--top-p` | `0.5` / `40` / `0.9` | サンプリング |
+| `--repetition-penalty` | `1.2` | 同じ残基の繰り返し抑制 |
+| `--seed` | `0` | 行ごとに `seed + index` で固定 |
+| `--greedy` | なし | サンプリングせず貪欲法 |
+| `--jsonl` | なし | 結果を JSONL に書き出す |
 
-`train.py` と違う点:
+`--jsonl` の各行は `{"index", "length", "closed", "invalid", "unique", "sequence"}` です。
+`closed` は末尾の `>` が出たか、`invalid` は標準 20 アミノ酸以外の文字数です。
 
-- 独自 collator をやめ、trl 標準の packing（`packing: true` / `packing_strategy: bfd`）と
-  padding-free collator に任せています。サンプル境界は `position_ids` のリセットで表現され、
-  transformers 5.x がそこから文書マスクを組むため、Flash Attention が無くても
-  詰めたサンプル同士は混ざりません（実測: packed 系列の 2 サンプル目の logits は単体実行と完全一致）
-- バッチは `per_device_train_batch_size: 1` × `gradient_accumulation_steps: 16`
-- wandb は使いません（`report_to: "none"`）
-- 7B を 8GB に載せるため `load_in_4bit: true`（参考実装の fp16 設定はそのままでは OOM）
+## データセット仕様
 
-## 学習前のフィルタリング
+`train.parquet` / `test.parquet` / `excluded.parquet` は同じ列を持ちます。
 
-トークン化の前に、マージされた配列を次の 2 条件で絞ります（`train.py` の `filter_candidates`）。
+| 列 | 型 | 内容 |
+| --- | --- | --- |
+| `primaryAccession` | string | UniProt accession |
+| `sequence` | string | アミノ酸配列（1 文字表記） |
+| `length` | int32 | 残基数 |
+| `clusterSize` | int32 | 50% クラスタのサイズ |
+| `faissRow` | int64 | 上流 faiss インデックスの行番号（この parquet の行番号ではない） |
+| `embedding` | fixed_size_list\<float32\>[1024] | ProTrek-650M のベクトル（L2 正規化済み） |
 
-| 条件 | 除外件数 |
-| --- | --- |
-| 残基数が 1024 を超える | 6,723 |
-| 標準 20 アミノ酸以外を含む（`X` / `U` / `B` / `Z` / `O`） | 851 |
+`excluded.parquet` だけ `exclusionReason` 列が増えます。
 
-118,576 件 → 111,002 件（93.6%）が残ります。件数はログにも出力されます。
+**除外する行**（`build_dataset.py` の `exclusion_reason`。[1] と [2] は
+`train_prollama_from_emb.py` のフィルタと同じ判定）:
 
-- **1024 残基**: ProTrek のエンコーダは先頭 1024 残基しか見ていないため、それより長い配列は
-  埋め込みと正解配列が別のタンパク質を指してしまう
-- **標準アミノ酸のみ**: 曖昧残基や非 canonical 残基を生成対象にしないため
+| 条件 | 件数 | 理由 |
+| --- | --- | --- |
+| 残基数が 1024 を超える | 6,723 | ProTrek は先頭 1024 残基しか見ていないので、ベクトルと正解配列が別物になる |
+| 標準 20 アミノ酸以外を含む（`X` / `U` / `B` / `Z` / `O`） | 851 | 曖昧・非 canonical 残基を生成させない |
+| トークン長が `--max-seq-length` を超える | 0（720 のとき） | 学習時に落とす（データセットには残る） |
 
-この後、トークン長が `--max-seq-length` を超えるサンプルがさらに除外されます。
+除外行は捨てずに `excluded.parquet` に残すので、フィルタは監査・巻き戻しできます。
+
+**split**: `--train-size`（既定 100,000）を train に、残りを test に置きます。配列が同一の行は
+必ず同じ側に入れ、長さバケット（0–50 / 50–100 / 100–200 / 200–400 / 400–800 / 800–1025）で
+層化するので、train と test の長さ分布が揃います。`split_ids.tsv` に割り当てが残ります。
+
+**埋め込み**: 上流 faiss の `IndexFlatIP`（次元 1024）から代表行のベクトルをそのまま取り出して
+います（再計算しないので上流と一致）。ノルムは 1.0 です。クラスタリング条件は SeqStudio の
+50% クラスタリングに合わせています（`--min-seq-id 0.5 --cov-mode 1 -c 0.8 --cluster-mode 0`）。
 
 ### フィルタ後のトークン長（実測）
 
@@ -183,13 +296,62 @@ uv run python train_stage1.py training.packing=false dataset.limit=200 training.
 | --- | --- | --- | --- | --- | --- |
 | 234.6 | 207 | 440 | 638 | 681 | 711 |
 
-最長は 1,013 残基で 711 トークンでした。アミノ酸は 1〜2 残基が 1 トークンにまとまるため、
-残基数よりトークン数は少なくなります。既定の `--max-seq-length 720` を超えるサンプルは
-0 件で、トークン長による除外は発生しません（704 なら 5 件）。
+既定の `--max-seq-length 720` を超えるサンプルは 0 件です。`576` まで下げると 3,329 件
+（3.0%）が学習から外れ、`704` なら 5 件です。
+
+## 仕組み
+
+### soft prompt の組み立て（`train_prollama_from_emb.py`）
+
+- prefix は `<s> <unk>×K ▁Seq = <`。`<unk>` の K トークンだけを projector の出力で置き換えます
+- prefix は文字列をトークナイズせず**トークン ID を直接組み立てます**。fast tokenizer は
+  `<unk>` の連続の直後で `Seq` を先頭スペースなしの形（id 23718）にしてしまい、事前学習で
+  使われた `▁Seq`（id 25981）にならないためです
+- 正解は `"Seq=<" + 配列 + ">"` をトークナイズし、指示部分の ID を差し引いて作ります。末尾の
+  `>` も学習対象です（事前学習の形式が `Seq=<配列>` なので、モデルは括弧を閉じる `>` を出します）
+- labels は配列 + EOS のみで、prefix は `-100`（プロンプト部分は損失に含めない）
+
+### packing と collator（`train_prollama_from_emb.py`）
+
+- サンプルを長い順に first-fit で詰め、合計が `--max-seq-length` に収まる組を作ります。
+  データセットの 1 行 = 1 組なので、shuffle も step 数も「組」単位です
+- collator は **サンプルごとに `position_ids` を 0 から振り直します**。これがサンプル境界の
+  目印で、`attention_mask` を渡さないことで transformers がブロック対角の因果マスクを組みます
+  （2D の `attention_mask` を渡すとこの判定が切れて、詰めたサンプル同士が互いを見てしまいます）
+- スロットは各サンプルの BOS 直後（offset 1）に置きます。組の中のどこに始まっても同じです
+- pad 部分は `labels = -100` で、因果マスクにより損失に影響しません
+
+### projector
+
+```
+LayerNorm(1024) → Linear(1024→2048) → GELU → Linear(2048→2048) → GELU
+   → [Linear(2048→4096)] × K（スロットごとに別ヘッド）→ LayerNorm → × 1/√4096
+```
+
+- 入力は**平均ベクトルを引いてから**通します。L2 正規化済みでも平均ベクトル（ノルム約 0.48）の
+  方向が支配的で、そのままだと全タンパク質が似た入力になるためです
+- 出力は `LayerNorm × 固定ゲイン`（`1/√4096`、ノルム約 1.0）。トークン埋め込みのノルム
+  （約 1.08）に合わせるためです。`F.normalize` は微分のヤコビアンが `1/‖out‖` で減衰し、
+  出力ノルムが大きくなると gradient が消えて戻らなくなるため使っていません
+- スロットごとにヘッドを分けているのは、1 本のベクトルでは帯域が足りず、モデルが
+  「配列らしい組成」だけを覚えてしまうためです
+
+### optimizer と loss
+
+- projector は PEFT の外側にあるので、optimizer に専用パラメータグループ（`--projector-lr`、
+  weight decay 0.01）として追加し、勾配クリップも本体とは別に掛けます
+- `Trainer` が勾配をゼロにするのは `model.zero_grad()` だけで projector には届きません。
+  そのままだと勾配が step をまたいで足し込まれ、実効学習率が 1 倍、2 倍、3 倍…と増えるため、
+  `on_optimizer_step` で projector の勾配を明示的にゼロにするコールバックを入れています
+- `num_items_in_batch` を渡して fused CE の正規化（sum(CE)/トークン数）と gradient
+  accumulation のスケールを合わせています
+- 量子化は 4bit（NF4）QLoRA、optimizer は `adamw_8bit`、スケジューラは cosine（warmup は
+  総 step の 3%）、bf16 が使えない環境では fp16 に自動で切り替わります
 
 ## メモリの目安
 
-8 GB の GPU（RTX 3060 Ti）で、4bit 量子化 + LoRA + gradient checkpointing の構成での実測値です。
+8 GB の GPU（RTX 3060 Ti）で、4bit 量子化 + LoRA + gradient checkpointing の構成での実測です。
+packing は 1 行を最大 `--max-seq-length` まで詰めるので、この表がそのまま上限の目安になります。
 
 | max_seq_length | ピーク VRAM |
 | --- | --- |
@@ -200,96 +362,44 @@ uv run python train_stage1.py training.packing=false dataset.limit=200 training.
 | 640 | OOM |
 | 720（既定） | 未計測（640 で OOM のため 8 GB では足りない見込み） |
 
-既定の `720` は 8 GB の GPU では収まらない見込みです。VRAM が足りない場合は
-`--max-seq-length` を下げてください。ただし 576 にすると、トークン長が上限を超える
-サンプル（3,329 件 / 3.0%）が学習から外れます。
-
-上表は長いバッチをまとめて通した場合の実測です。実際の学習は `batch=1`・
-`gradient_accumulation_steps=16`・`group_by_length`（似た長さのサンプルをまとめる）なので、
-ピークはもっと低くなります。1 スロット版は `--max-seq-length 704` で 4,000 step
-完走しています（`checkpoint-4000/training_args.bin` の `max_length = 704`）。
-
-## データについて
-
-- 埋め込み: `westlake-repl/faiss_index` の `SwissProt/ProTrek_650M_UniRef50/sequence`
-  - faiss `IndexFlatIP`、次元 1024、L2 正規化済み
-  - `ids.tsv` の行番号 = faiss のベクトル番号
-  - `ids.tsv` の 2 列目が配列、3 列目が長さ
-- クラスタリング条件は SeqStudio の 50% クラスタリングに合わせています
-  （`--min-seq-id 0.5 --cov-mode 1 -c 0.8 --cluster-mode 0`）
-- ProTrek のエンコーダは先頭 1024 残基しか見ていないため、それより長い配列は学習から除外します
-
-## 学習の仕組み（要点）
-
-- 入力は `<s> <unk>×10 ▁Seq = <` + 配列。`<unk>` の 10 トークン分の埋め込みだけを ProTrek ベクトルで置き換えます
-  （指示部分 `▁Seq = <` は元モデルが事前学習した形のまま残す）
-- prefix は文字列 `"<unk>"*10 + "Seq=<"` をトークナイズするのではなく、**トークン ID を直接組み立てます**。
-  fast tokenizer は `<unk>` の連続の直後では `Seq` を先頭スペースなしの形（id 23718）にしてしまい、
-  事前学習で使われた `▁Seq`（id 25981）にならないためです
-- projector は `LayerNorm → Linear(512) → GELU → Linear(512) → GELU` の共通 trunk と、
-  スロットごとの `Linear(4096)` ヘッド 10 本で構成します。1 本のベクトルでは情報量が
-  足りず（下記）、モデルが「配列らしい composition」に逃げてしまうためです
-- 入力は ProTrek ベクトルの**平均ベクトルを引いてから**通します。L2 正規化済みのベクトルでも
-  平均ベクトル（ノルム約 0.48）の方向が支配的で、そのままだと全タンパク質が似た入力になります
-- 出力は `LayerNorm × 固定ゲイン`（`1/√4096`、ノルム約 1.0）。トークン埋め込みのノルム
-  （約 1.08）に合わせるためです。以前は `F.normalize`（L2）を使っていましたが、
-  この微分のヤコビアンが `1/‖out‖` で減衰するため、出力ノルムが大きくなると projector の
-  勾配が消えて二度と戻らなくなります（実測で LoRA 勾配の 1.4e-3 まで低下）
-- projector は PEFT の外側にあるので、optimizer に専用のパラメータグループ
-  （lr `1e-4`、weight decay `0.01`）として追加しています。ただし `Trainer` が勾配を
-  ゼロにするのは `model.zero_grad()` だけで、これはモデル内のパラメータしか消しません。
-  projector の勾配は消えないまま次の step に足し込まれ、実効学習率が step ごとに
-  1 倍、2 倍、3 倍…と増えていきます（同一勾配を 4 step 流した検証で 1.03 → 2.06 → 3.09 → 4.12）。
-  そのため `on_optimizer_step` で projector の勾配を明示的にゼロにするコールバックと、
-  projector 側の勾配クリップ（`_clip_grad_norm`）を入れています
-- labels は配列部分と EOS のみ（プロンプト部分は `-100`）
-- チェックポイント保存のたびに `checkpoint-N/protein_projector.pt` も一緒に保存します。
-  スロット数・prefix・平均ベクトルなどのメタデータも一緒に入れてあり、`inference.py` は
-  これを読んで同じ構成の projector を組み直します
-  （`Trainer._get_output_dir()` は run ディレクトリを返すので、`checkpoint-N` は自前で付けて
-  います。run 直下に書くと全チェックポイントが 1 つのファイルを共有してしまい、`--resume` が
-  別 step の projector を読むことになります）
-- 学習ログの `projector_slot_cos` は 10 スロット間の平均コサインです。1.0 に近づくなら
-  スロットが縮退していて、soft prompt が実質 1 本分の情報しか運んでいないことになります
-
-### なぜ 1 トークンから 10 トークンに変えたか
-
-以前の 1 スロット版では loss が 4.1〜4.2 から下がりませんでした。計測すると:
-
-| 計測 | 値 |
-| --- | --- |
-| 1 スロット版: 正解配列の CE / シャッフルした配列の CE | 4.1899 / 4.2240 |
-| 1 スロット版: 学習後の projector 出力の平均コサイン | 0.954（初期値は 0.275） |
-| 1 スロット版: 学習後の projector 出力の実効ランク | 1.45（初期値 159.7） |
-| 注入なしで同じ LoRA を 250 step 学習したときの heldout CE | 4.2186（学習 loss 4.2227） |
-| 10 スロット版で同じ 250 step 学習したときの heldout CE | 4.2236（学習 loss 4.2071） |
-| 10 スロット版のスロット間コサイン（学習後） | 0.030 |
-| ユニグラムのエントロピー | 4.7725 |
-| 組成だけを当てる oracle の CE | 4.33 |
-
-つまり**タンパク質ベクトルはほとんど使われておらず**、モデルはアミノ酸組成だけを覚えて
-いました。原因は (1) 1 トークンでは帯域が足りない、(2) `F.normalize` で勾配が消える、
-(3) 平均ベクトルで入力が縮退する、の 3 点です。上の設計はこの 3 点に対応しています。
-
-なお 10 スロット版は 250 step 時点の heldout CE が注入なしとほぼ同じ（4.2236 対 4.2186）です。
-これは「改善した」とも「まだ効いていない」とも言えない、判定不能な状態です
-（1 スロット版も同じく注入なしと同じ値で、そちらは実際に壊れていました）。
-250 step の絶対値では区別できないので、判定には同じモデルで
-**正解ベクトルとシャッフルしたベクトルの CE を比べる** 必要があります。
-差がなければモデルがスロットを無視している証拠になり、絶対値では区別できません。
+既定の `720` は 8 GB には収まらない見込みです。VRAM が足りない場合は `--max-seq-length` を
+下げてください。`--gradient-checkpointing off` は速い代わりにメモリを食い、`--no-packing` は
+バッチ内最長まで pad するため packing より不利です。`--no-4bit` にすると 7B を fp16/bf16 で
+載せることになり、8 GB ではまず収まりません。
 
 ## うまくいかないとき
 
 - **`torch.cuda.is_available()` が False**
-  torch が cu130 になっていませんか。`uv lock` で `pyproject.toml` の cu129 index 指定が
-  残っていることを確認して `uv sync --reinstall-package torch` を実行してください。
+  torch が cu130 になっていませんか。`pyproject.toml` の cu129 index 指定を確認して
+  `uv sync --reinstall-package torch` を実行してください。
 - **`MMseqs2 not found`**
   `bash tools/get_mmseqs.sh` を実行するか、`--mmseqs` でパスを指定してください。
 - **CUDA OOM**
   `--max-seq-length` を下げてください（上表参照）。
-- **`missing: ... (run build_dataset.py first)`**
-  先に `build_dataset.py` を実行してください。
-- **`Missing key(s) in state_dict: "trunk.0.weight" ...`**
-  1 スロット版（旧 `protein_projector.pt`）のチェックポイントです。projector の構成が
-  変わったので、学習をやり直すか、`--output-dir` を分けて新しい学習を回してください
-  （旧チェックポイントと LoRA アダプタの互換性はありません）。
+- **`no sample survived the filters; raise --max-seq-length`**
+  フィルタ後に 1 件も残っていません。`--max-seq-length` を上げるか `--limit` を外してください。
+- **`no projector at ...; run train_prollama_from_emb.py first`**
+  `--adapter` のディレクトリに `protein_projector.pt` がありません。学習を先に回すか、
+  `--adapter` を学習時の `--output-dir` に合わせてください。
+- **`--resume` でスロット数の assert に落ちる**
+  チェックポイントの `num_tokens` と `--num-tokens` が違います。学習時と同じ値を渡してください。
+- **`--upload` が 401 / 403 で失敗する**
+  書き込み権限のあるトークンで `hf auth login` してから `--upload` を付けてください。
+  リポジトリ名を変えるなら `--repo-id`、非公開にしたければ `--private` を指定します。
+
+## legacy/
+
+`legacy/` には、この 3 本に関係しない旧スクリプトが入っています。`.gitignore` 済みで、
+パイプラインには不要です。
+
+- `train.py` — ローカル `.npy`（`build_dataset.py --legacy-dir` の出力）から学習する旧本体
+- `train_stage1.py` / `inference_stage1.py` / `config.yaml` — ProTrek を使わない stage1 ベースライン
+- `train_prollama.py` / `inference_prollama.py` — ProTrek なしの ProLLaMA テキスト版
+- `inference.py` — 旧 `train.py` のローカル `.npy` 経路用の推論
+- `train_v1_backup.py` — 旧 `train.py` のバックアップ
+- `stage1_colab.ipynb` — stage1 の Colab ノートブック
+
+projector・prefix・answer encoding などの共有パーツは `train_prollama_from_emb.py` に移したので、
+メイン 3 本はこのフォルダに依存しません。legacy 側は自己完結していて、`uv run python
+legacy/train_stage1.py` のように直接実行すれば import も通ります（`legacy/train.py` も同じ
+フォルダにあります）。

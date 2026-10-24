@@ -444,7 +444,7 @@ def main():
             logging_steps = 10,
             save_strategy = "steps",
             save_steps = 500,
-            save_total_limit = 2,
+            save_total_limit = 1,
             report_to = "none",
             dataloader_num_workers = 2,
             dataloader_pin_memory = True,

@@ -178,11 +178,11 @@ def parse_args():
     parser.add_argument("--resume", action = "store_true")
     parser.add_argument("--lora-r", type = int, default = 128)
     parser.add_argument("--lora-alpha", type = int, default = 256)
-    parser.add_argument("--learning-rate", type = float, default = 2e-4)
-    parser.add_argument("--projector-lr", type = float, default = 2e-4)
-    parser.add_argument("--batch-size", type = int, default = 1)
-    parser.add_argument("--grad-accum", type = int, default = 2)
-    parser.add_argument("--epochs", type = float, default = 1.0)
+    parser.add_argument("--learning-rate", type = float, default = 1e-4)
+    parser.add_argument("--projector-lr", type = float, default = 1e-4)
+    parser.add_argument("--batch-size", type = int, default = 2)
+    parser.add_argument("--grad-accum", type = int, default = 4)
+    parser.add_argument("--epochs", type = float, default = 2.0)
     parser.add_argument("--gradient-checkpointing", default = "unsloth",
                         choices = ["unsloth", "standard", "off"])
     parser.add_argument("--no-4bit", dest = "load_in_4bit", action = "store_false",
@@ -436,7 +436,7 @@ def main():
             learning_rate = args.learning_rate,
             lr_scheduler_type = "cosine",
             warmup_steps = 0.03,  # trl 1.15: float warmup_steps is a ratio
-            weight_decay = 0.001,
+            weight_decay = 0.01,
             optim = "adamw_8bit",
             bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
             fp16 = not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
